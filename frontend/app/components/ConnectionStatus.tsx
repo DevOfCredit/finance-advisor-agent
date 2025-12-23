@@ -13,6 +13,8 @@ export default function ConnectionStatus() {
   const [syncingService, setSyncingService] = useState<'gmail' | 'hubspot' | null>(null)
   const [gmailSyncing, setGmailSyncing] = useState(false)
   const [hubspotSyncing, setHubspotSyncing] = useState(false)
+  const [gmailSyncMode, setGmailSyncMode] = useState<'month' | 'all'>('month')
+  const [hubspotSyncMode, setHubspotSyncMode] = useState<'month' | 'all'>('month')
   const hasAutoSynced = useRef(false)
 
   const handleConnectGoogle = () => {
@@ -23,15 +25,16 @@ export default function ConnectionStatus() {
     window.location.href = `${API_URL}/api/auth/hubspot`
   }
 
-  const handleSyncGmail = async () => {
+  const handleSyncGmail = async (mode: 'month' | 'all' = 'month') => {
     if (!token) return
     setShowOverlay(true)
     setSyncingService('gmail')
     setGmailSyncing(true)
+    setGmailSyncMode(mode)
     try {
       await axios.post(
         `${API_URL}/api/integrations/sync/gmail`,
-        {},
+        { sync_mode: mode },
         {
           headers: { Authorization: `Bearer ${token}` },
         }
@@ -44,15 +47,16 @@ export default function ConnectionStatus() {
     }
   }
 
-  const handleSyncHubSpot = async () => {
+  const handleSyncHubSpot = async (mode: 'month' | 'all' = 'month') => {
     if (!token) return
     setShowOverlay(true)
     setSyncingService('hubspot')
     setHubspotSyncing(true)
+    setHubspotSyncMode(mode)
     try {
       await axios.post(
         `${API_URL}/api/integrations/sync/hubspot`,
-        {},
+        { sync_mode: mode },
         {
           headers: { Authorization: `Bearer ${token}` },
         }
@@ -78,16 +82,17 @@ export default function ConnectionStatus() {
       hasAutoSynced.current = true
       let syncPromises: Promise<void>[] = []
 
-      // Auto-sync Gmail if connected
+      // Auto-sync Gmail if connected (this month only)
       if (user.has_google) {
         const gmailSync = async () => {
           try {
             setGmailSyncing(true)
+            setGmailSyncMode('month')
             setShowOverlay(true)
             setSyncingService('gmail')
             await axios.post(
               `${API_URL}/api/integrations/sync/gmail`,
-              {},
+              { sync_mode: 'month' },
               {
                 headers: { Authorization: `Bearer ${token}` },
               }
@@ -100,11 +105,12 @@ export default function ConnectionStatus() {
         syncPromises.push(gmailSync())
       }
 
-      // Auto-sync HubSpot if connected
+      // Auto-sync HubSpot if connected (this month only)
       if (user.has_hubspot) {
         const hubspotSync = async () => {
           try {
             setHubspotSyncing(true)
+            setHubspotSyncMode('month')
             setShowOverlay(true)
             // Only set syncingService if Gmail is not syncing
             if (!user.has_google || !gmailSyncing) {
@@ -112,7 +118,7 @@ export default function ConnectionStatus() {
             }
             await axios.post(
               `${API_URL}/api/integrations/sync/hubspot`,
-              {},
+              { sync_mode: 'month' },
               {
                 headers: { Authorization: `Bearer ${token}` },
               }
@@ -157,6 +163,8 @@ export default function ConnectionStatus() {
         if (showOverlay && !gmailSyncingStatus && !hubspotSyncingStatus) {
           setShowOverlay(false)
           setSyncingService(null)
+          // Refresh user data to get updated connection status (in case tokens were cleared)
+          await fetchUser()
         }
       } catch (error) {
         console.error('Failed to fetch sync status:', error)
@@ -173,7 +181,7 @@ export default function ConnectionStatus() {
     return () => {
       if (interval) clearInterval(interval)
     }
-  }, [token, user, gmailSyncing, hubspotSyncing, showOverlay])
+  }, [token, user, gmailSyncing, hubspotSyncing, showOverlay, fetchUser])
 
   return (
     <>
@@ -191,17 +199,17 @@ export default function ConnectionStatus() {
               {/* Message */}
               <h3 className="text-lg font-semibold text-gray-900 mb-2">
                 {gmailSyncing && hubspotSyncing 
-                  ? 'Syncing Gmail & HubSpot...'
+                  ? `Syncing Gmail & HubSpot${(gmailSyncMode === 'all' || hubspotSyncMode === 'all') ? ' (All)' : ' (This Month)'}...`
                   : syncingService === 'gmail' 
-                    ? 'Syncing Gmail...'
-                    : 'Syncing HubSpot...'}
+                    ? `Syncing Gmail${gmailSyncMode === 'all' ? ' (All)' : ' (This Month)'}...`
+                    : `Syncing HubSpot${hubspotSyncMode === 'all' ? ' (All)' : ' (This Month)'}...`}
               </h3>
               <p className="text-sm text-gray-600 text-center mb-6">
                 {gmailSyncing && hubspotSyncing
-                  ? 'Importing your emails and contacts. This may take a few minutes.'
+                  ? `Importing your ${(gmailSyncMode === 'all' || hubspotSyncMode === 'all') ? 'all ' : 'this month\'s '}emails and contacts. This may take a few minutes.`
                   : syncingService === 'gmail' 
-                    ? 'Importing your emails and creating searchable embeddings. This may take a few minutes.'
-                    : 'Importing your contacts and notes. This may take a few minutes.'}
+                    ? `Importing your ${gmailSyncMode === 'all' ? 'all ' : 'this month\'s '}emails and creating searchable embeddings. This may take a few minutes.`
+                    : `Importing your ${hubspotSyncMode === 'all' ? 'all ' : 'this month\'s '}contacts and notes. This may take a few minutes.`}
               </p>
               
               {/* Dismiss button */}
@@ -232,17 +240,30 @@ export default function ConnectionStatus() {
                   <span className="text-sm font-semibold text-gray-900">{user.google_email}</span>
                 </div>
                 <div className="h-5 w-px bg-gray-200"></div>
-                <button
-                  onClick={handleSyncGmail}
-                  disabled={gmailSyncing}
-                  className={`text-xs font-semibold px-3 py-1 rounded-md transition-all ${
-                    gmailSyncing 
-                      ? 'bg-blue-100 text-blue-700 cursor-not-allowed' 
-                      : 'bg-blue-50 text-blue-600 hover:bg-blue-100 hover:text-blue-700'
-                  }`}
-                >
-                  {gmailSyncing ? 'Syncing...' : 'Sync'}
-                </button>
+                <div className="flex items-center gap-2">
+                  <button
+                    onClick={() => handleSyncGmail('month')}
+                    disabled={gmailSyncing}
+                    className={`text-xs font-semibold px-3 py-1 rounded-md transition-all ${
+                      gmailSyncing 
+                        ? 'bg-blue-100 text-blue-700 cursor-not-allowed' 
+                        : 'bg-blue-50 text-blue-600 hover:bg-blue-100 hover:text-blue-700'
+                    }`}
+                  >
+                    {gmailSyncing && gmailSyncMode === 'month' ? 'Syncing for month...' : 'Sync for month'}
+                  </button>
+                  <button
+                    onClick={() => handleSyncGmail('all')}
+                    disabled={gmailSyncing}
+                    className={`text-xs font-semibold px-3 py-1 rounded-md transition-all ${
+                      gmailSyncing 
+                        ? 'bg-blue-100 text-blue-700 cursor-not-allowed' 
+                        : 'bg-blue-50 text-blue-600 hover:bg-blue-100 hover:text-blue-700'
+                    }`}
+                  >
+                    {gmailSyncing && gmailSyncMode === 'all' ? 'Syncing All...' : 'Sync All'}
+                  </button>
+                </div>
               </div>
             ) : (
               <div className="px-4 py-2 bg-white rounded-lg border-2 border-dashed border-gray-300 hover:border-blue-400 transition-colors">
@@ -266,17 +287,30 @@ export default function ConnectionStatus() {
                   <span className="text-sm font-semibold text-gray-900">{user.hubspot_name || 'HubSpot'}</span>
                 </div>
                 <div className="h-5 w-px bg-gray-200"></div>
-                <button
-                  onClick={handleSyncHubSpot}
-                  disabled={hubspotSyncing}
-                  className={`text-xs font-semibold px-3 py-1 rounded-md transition-all ${
-                    hubspotSyncing 
-                      ? 'bg-orange-100 text-orange-700 cursor-not-allowed' 
-                      : 'bg-orange-50 text-orange-600 hover:bg-orange-100 hover:text-orange-700'
-                  }`}
-                >
-                  {hubspotSyncing ? 'Syncing...' : 'Sync'}
-                </button>
+                <div className="flex items-center gap-2">
+                  <button
+                    onClick={() => handleSyncHubSpot('month')}
+                    disabled={hubspotSyncing}
+                    className={`text-xs font-semibold px-3 py-1 rounded-md transition-all ${
+                      hubspotSyncing 
+                        ? 'bg-orange-100 text-orange-700 cursor-not-allowed' 
+                        : 'bg-orange-50 text-orange-600 hover:bg-orange-100 hover:text-orange-700'
+                    }`}
+                  >
+                    {hubspotSyncing && hubspotSyncMode === 'month' ? 'Syncing for month...' : 'Sync for month'}
+                  </button>
+                  <button
+                    onClick={() => handleSyncHubSpot('all')}
+                    disabled={hubspotSyncing}
+                    className={`text-xs font-semibold px-3 py-1 rounded-md transition-all ${
+                      hubspotSyncing 
+                        ? 'bg-orange-100 text-orange-700 cursor-not-allowed' 
+                        : 'bg-orange-50 text-orange-600 hover:bg-orange-100 hover:text-orange-700'
+                    }`}
+                  >
+                    {hubspotSyncing && hubspotSyncMode === 'all' ? 'Syncing All...' : 'Sync All'}
+                  </button>
+                </div>
               </div>
             ) : (
               <div className="px-4 py-2 bg-white rounded-lg border-2 border-dashed border-gray-300 hover:border-orange-400 transition-colors">

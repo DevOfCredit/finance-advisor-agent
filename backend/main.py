@@ -35,7 +35,7 @@ async def lifespan(app: FastAPI):
     from app.routers.integrations import scheduled_email_polling
     scheduler.add_job(
         scheduled_email_polling,
-        trigger=IntervalTrigger(minutes=5),
+        trigger=IntervalTrigger(seconds=20),
         id="email_polling",
         replace_existing=True
     )

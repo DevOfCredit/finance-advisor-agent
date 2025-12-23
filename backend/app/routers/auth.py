@@ -70,8 +70,8 @@ async def google_callback(code: str, db: Session = Depends(get_db)):
         refresh_token = token.get("refresh_token")
         expires_at = None
         if "expires_in" in token:
-            from datetime import datetime, timedelta
-            expires_at = datetime.utcnow() + timedelta(seconds=token["expires_in"])
+            from datetime import datetime, timedelta, timezone
+            expires_at = datetime.now(timezone.utc) + timedelta(seconds=token["expires_in"])
         
         # Get user info
         async with httpx.AsyncClient() as client:
@@ -192,8 +192,8 @@ async def hubspot_callback(code: str, db: Session = Depends(get_db)):
         refresh_token = token.get("refresh_token")
         expires_at = None
         if "expires_in" in token:
-            from datetime import datetime, timedelta
-            expires_at = datetime.utcnow() + timedelta(seconds=token["expires_in"])
+            from datetime import datetime, timedelta, timezone
+            expires_at = datetime.now(timezone.utc) + timedelta(seconds=token["expires_in"])
         
         # Get account info
         hubspot_service = HubSpotService(access_token)

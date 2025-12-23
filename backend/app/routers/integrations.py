@@ -4,9 +4,11 @@ Integration routes for syncing data from Gmail, Calendar, and HubSpot.
 
 from fastapi import APIRouter, Depends, HTTPException, status, BackgroundTasks, Header
 from typing import Optional
+from pydantic import BaseModel
 from sqlalchemy.orm import Session
 from sqlalchemy import func
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+import httpx
 from app.database import get_db, SessionLocal
 from app.models import User, Email, Contact
 from app.services.google_service import GoogleService
@@ -16,20 +18,49 @@ from app.routers.chat import get_current_user
 
 router = APIRouter()
 
+
+class SyncRequest(BaseModel):
+    """Request model for sync operations."""
+    sync_mode: str = "month"  # "month" or "all"
+
 # In-memory sync status tracking
 # Format: {user_id: {"gmail": {"syncing": bool, "started_at": datetime}, "hubspot": {...}}}
 sync_status = {}
 
 
+def clear_google_connection(user: User, db: Session):
+    """Clear Google connection when token expires."""
+    user.google_access_token = None
+    user.google_refresh_token = None
+    user.google_token_expires_at = None
+    user.google_email = None
+    db.commit()
+    print(f"Cleared Google connection for user {user.id} due to expired token")
+
+
+def clear_hubspot_connection(user: User, db: Session):
+    """Clear HubSpot connection when token expires."""
+    user.hubspot_access_token = None
+    user.hubspot_refresh_token = None
+    user.hubspot_token_expires_at = None
+    user.hubspot_name = None
+    user.hubspot_contact_id = None
+    db.commit()
+    print(f"Cleared HubSpot connection for user {user.id} due to expired token")
+
+
 @router.post("/sync/gmail")
 async def sync_gmail(
+    request: SyncRequest,
     authorization: Optional[str] = Header(None, alias="Authorization"),
     background_tasks: BackgroundTasks = BackgroundTasks(),
     db: Session = Depends(get_db)
 ):
     """
     Sync emails from Gmail.
-    Runs in background to import all emails and create embeddings.
+    Runs in background to import emails and create embeddings.
+    
+    sync_mode: "month" to sync only this month's emails, "all" to sync all emails.
     """
     user = get_current_user(authorization, db)
     
@@ -44,19 +75,24 @@ async def sync_gmail(
         sync_status[user.id] = {}
     sync_status[user.id]["gmail"] = {
         "syncing": True,
-        "started_at": datetime.utcnow().isoformat()
+        "sync_mode": request.sync_mode,
+        "started_at": datetime.now(timezone.utc).isoformat()
     }
     
     # Add background task - don't pass db session, create new one in background task
-    background_tasks.add_task(sync_gmail_background, user.id)
+    background_tasks.add_task(sync_gmail_background, user.id, request.sync_mode)
     
-    return {"message": "Gmail sync started"}
+    return {"message": f"Gmail sync started ({request.sync_mode} mode)"}
 
 
-async def sync_gmail_background(user_id: int):
+async def sync_gmail_background(user_id: int, sync_mode: str = "month"):
     """
     Background task to sync Gmail emails.
     Creates its own database session since request session will be closed.
+    
+    Args:
+        user_id: User ID to sync emails for
+        sync_mode: "month" to sync only this month's emails, "all" to sync all emails
     """
     # Create a new database session for the background task
     db = SessionLocal()
@@ -68,12 +104,34 @@ async def sync_gmail_background(user_id: int):
         google_service = GoogleService(user.google_access_token)
         
         try:
-            # Get all emails
+            # Build query based on sync mode
+            query = None
+            if sync_mode == "month":
+                # Get start of current month in UTC
+                now = datetime.now(timezone.utc)
+                month_start = datetime(now.year, now.month, 1, tzinfo=timezone.utc)
+                # Convert to Unix timestamp for Gmail query
+                month_start_timestamp = int(month_start.timestamp())
+                query = f"after:{month_start_timestamp}"
+            
             page_token = None
             imported_count = 0
         
             while True:
-                result = await google_service.list_emails(max_results=100, page_token=page_token)
+                try:
+                    result = await google_service.list_emails(max_results=100, page_token=page_token, query=query)
+                except httpx.HTTPStatusError as e:
+                    if e.response.status_code == 401:
+                        # Token expired, clear connection
+                        clear_google_connection(user, db)
+                        if user_id in sync_status and "gmail" in sync_status[user_id]:
+                            sync_status[user_id]["gmail"]["syncing"] = False
+                            sync_status[user_id]["gmail"]["error"] = "Google token expired. Please reconnect."
+                            sync_status[user_id]["gmail"]["completed_at"] = datetime.now(timezone.utc).isoformat()
+                        print(f"Gmail sync failed for user {user_id}: Token expired (401)")
+                        return
+                    raise
+                
                 messages = result.get("messages", [])
                 
                 for msg in messages:
@@ -89,7 +147,19 @@ async def sync_gmail_background(user_id: int):
                         continue
                     
                     # Get full email
-                    email_data = await google_service.get_email(gmail_id)
+                    try:
+                        email_data = await google_service.get_email(gmail_id)
+                    except httpx.HTTPStatusError as e:
+                        if e.response.status_code == 401:
+                            # Token expired, clear connection
+                            clear_google_connection(user, db)
+                            if user_id in sync_status and "gmail" in sync_status[user_id]:
+                                sync_status[user_id]["gmail"]["syncing"] = False
+                                sync_status[user_id]["gmail"]["error"] = "Google token expired. Please reconnect."
+                                sync_status[user_id]["gmail"]["completed_at"] = datetime.now(timezone.utc).isoformat()
+                            print(f"Gmail sync failed for user {user_id}: Token expired (401)")
+                            return
+                        raise
                     parsed = google_service._parse_email(email_data)
                     
                     # Create email record
@@ -136,10 +206,10 @@ async def sync_gmail_background(user_id: int):
             # Mark sync as completed
             if user_id in sync_status and "gmail" in sync_status[user_id]:
                 sync_status[user_id]["gmail"]["syncing"] = False
-                sync_status[user_id]["gmail"]["completed_at"] = datetime.utcnow().isoformat()
+                sync_status[user_id]["gmail"]["completed_at"] = datetime.now(timezone.utc).isoformat()
                 sync_status[user_id]["gmail"]["imported_count"] = imported_count
             
-            print(f"Gmail sync completed for user {user_id}. Imported {imported_count} emails.")
+            print(f"Gmail sync completed for user {user_id} ({sync_mode} mode). Imported {imported_count} emails.")
         
         except Exception as e:
             print(f"Error syncing Gmail for user {user_id}: {e}")
@@ -149,7 +219,7 @@ async def sync_gmail_background(user_id: int):
             if user_id in sync_status and "gmail" in sync_status[user_id]:
                 sync_status[user_id]["gmail"]["syncing"] = False
                 sync_status[user_id]["gmail"]["error"] = str(e)
-                sync_status[user_id]["gmail"]["completed_at"] = datetime.utcnow().isoformat()
+                sync_status[user_id]["gmail"]["completed_at"] = datetime.now(timezone.utc).isoformat()
     finally:
         # Always close the database session
         db.close()
@@ -157,13 +227,16 @@ async def sync_gmail_background(user_id: int):
 
 @router.post("/sync/hubspot")
 async def sync_hubspot(
+    request: SyncRequest,
     authorization: Optional[str] = Header(None, alias="Authorization"),
     background_tasks: BackgroundTasks = BackgroundTasks(),
     db: Session = Depends(get_db)
 ):
     """
     Sync contacts from HubSpot.
-    Runs in background to import all contacts and create embeddings.
+    Runs in background to import contacts and create embeddings.
+    
+    sync_mode: "month" to sync only contacts updated this month, "all" to sync all contacts.
     """
     user = get_current_user(authorization, db)
     
@@ -178,19 +251,24 @@ async def sync_hubspot(
         sync_status[user.id] = {}
     sync_status[user.id]["hubspot"] = {
         "syncing": True,
-        "started_at": datetime.utcnow().isoformat()
+        "sync_mode": request.sync_mode,
+        "started_at": datetime.now(timezone.utc).isoformat()
     }
     
     # Add background task - don't pass db session, create new one in background task
-    background_tasks.add_task(sync_hubspot_background, user.id)
+    background_tasks.add_task(sync_hubspot_background, user.id, request.sync_mode)
     
-    return {"message": "HubSpot sync started"}
+    return {"message": f"HubSpot sync started ({request.sync_mode} mode)"}
 
 
-async def sync_hubspot_background(user_id: int):
+async def sync_hubspot_background(user_id: int, sync_mode: str = "month"):
     """
     Background task to sync HubSpot contacts.
     Creates its own database session since request session will be closed.
+    
+    Args:
+        user_id: User ID to sync contacts for
+        sync_mode: "month" to sync only contacts updated this month, "all" to sync all contacts
     """
     # Create a new database session for the background task
     db = SessionLocal()
@@ -202,16 +280,53 @@ async def sync_hubspot_background(user_id: int):
         hubspot_service = HubSpotService(user.hubspot_access_token)
         
         try:
+            # Calculate month start if needed
+            month_start = None
+            if sync_mode == "month":
+                now = datetime.now(timezone.utc)
+                month_start = datetime(now.year, now.month, 1, tzinfo=timezone.utc)
+            
             imported_count = 0
             after = None
         
             while True:
-                result = await hubspot_service.list_all_contacts(limit=100, after=after)
+                try:
+                    result = await hubspot_service.list_all_contacts(limit=100, after=after)
+                except httpx.HTTPStatusError as e:
+                    if e.response.status_code == 401:
+                        # Token expired, clear connection
+                        clear_hubspot_connection(user, db)
+                        if user_id in sync_status and "hubspot" in sync_status[user_id]:
+                            sync_status[user_id]["hubspot"]["syncing"] = False
+                            sync_status[user_id]["hubspot"]["error"] = "HubSpot token expired. Please reconnect."
+                            sync_status[user_id]["hubspot"]["completed_at"] = datetime.now(timezone.utc).isoformat()
+                        print(f"HubSpot sync failed for user {user_id}: Token expired (401)")
+                        return
+                    raise
+                
                 contacts = result.get("results", [])
                 
                 for contact_data in contacts:
                     hubspot_id = contact_data["id"]
                     properties = contact_data.get("properties", {})
+                    
+                    # If syncing this month only, check if contact was updated this month
+                    if sync_mode == "month" and month_start:
+                        # Check hs_lastmodifieddate or createdate
+                        last_modified = properties.get("hs_lastmodifieddate")
+                        if not last_modified:
+                            last_modified = properties.get("createdate")
+                        
+                        if last_modified:
+                            try:
+                                # HubSpot timestamps are in milliseconds
+                                last_modified_dt = datetime.fromtimestamp(int(last_modified) / 1000, tz=timezone.utc)
+                                if last_modified_dt < month_start:
+                                    # Skip contacts not updated this month
+                                    continue
+                            except (ValueError, TypeError):
+                                # If we can't parse the date, include it to be safe
+                                pass
                     
                     # Check if already imported
                     existing = db.query(Contact).filter(
@@ -229,7 +344,19 @@ async def sync_hubspot_background(user_id: int):
                         existing.raw_data = contact_data
                     else:
                         # Get notes
-                        notes_data = await hubspot_service.get_contact_notes(hubspot_id)
+                        try:
+                            notes_data = await hubspot_service.get_contact_notes(hubspot_id)
+                        except httpx.HTTPStatusError as e:
+                            if e.response.status_code == 401:
+                                # Token expired, clear connection
+                                clear_hubspot_connection(user, db)
+                                if user_id in sync_status and "hubspot" in sync_status[user_id]:
+                                    sync_status[user_id]["hubspot"]["syncing"] = False
+                                    sync_status[user_id]["hubspot"]["error"] = "HubSpot token expired. Please reconnect."
+                                    sync_status[user_id]["hubspot"]["completed_at"] = datetime.now(timezone.utc).isoformat()
+                                print(f"HubSpot sync failed for user {user_id}: Token expired (401)")
+                                return
+                            raise
                         notes_text = "\n".join([
                             n.get("properties", {}).get("hs_note_body", "")
                             for n in notes_data
@@ -270,10 +397,10 @@ async def sync_hubspot_background(user_id: int):
             # Mark sync as completed
             if user_id in sync_status and "hubspot" in sync_status[user_id]:
                 sync_status[user_id]["hubspot"]["syncing"] = False
-                sync_status[user_id]["hubspot"]["completed_at"] = datetime.utcnow().isoformat()
+                sync_status[user_id]["hubspot"]["completed_at"] = datetime.now(timezone.utc).isoformat()
                 sync_status[user_id]["hubspot"]["imported_count"] = imported_count
             
-            print(f"HubSpot sync completed for user {user_id}. Imported {imported_count} contacts.")
+            print(f"HubSpot sync completed for user {user_id} ({sync_mode} mode). Imported {imported_count} contacts.")
         
         except Exception as e:
             print(f"Error syncing HubSpot for user {user_id}: {e}")
@@ -283,7 +410,7 @@ async def sync_hubspot_background(user_id: int):
             if user_id in sync_status and "hubspot" in sync_status[user_id]:
                 sync_status[user_id]["hubspot"]["syncing"] = False
                 sync_status[user_id]["hubspot"]["error"] = str(e)
-                sync_status[user_id]["hubspot"]["completed_at"] = datetime.utcnow().isoformat()
+                sync_status[user_id]["hubspot"]["completed_at"] = datetime.now(timezone.utc).isoformat()
     finally:
         # Always close the database session
         db.close()
@@ -339,12 +466,26 @@ async def poll_new_emails(user_id: int):
         # Don't poll if a manual sync is already in progress
         if user_id in sync_status and sync_status[user_id].get("gmail", {}).get("syncing", False):
             return
+
+        print("Polling for new emails", user.google_token_expires_at);
+
+        # Check if token is expired - if so, skip polling (user will need to reconnect)
+        if user.google_token_expires_at:
+            now = datetime.now(timezone.utc)
+            if user.google_token_expires_at < now:
+                print(f"Skipping email polling for user {user_id}: Token expired")
+                return
+        
+        # Refresh user object to ensure we have the latest token
+        db.refresh(user)
+        if not user.google_access_token:
+            return
         
         google_service = GoogleService(user.google_access_token)
         
         # Get the most recent email's received_at timestamp
         # Check for emails received in the last 10 minutes (to catch any we might have missed)
-        cutoff_time = datetime.utcnow() - timedelta(minutes=10)
+        cutoff_time = datetime.now(timezone.utc) - timedelta(minutes=10)
         
         # Convert to Unix timestamp for Gmail query
         cutoff_timestamp = int(cutoff_time.timestamp())
@@ -355,93 +496,118 @@ async def poll_new_emails(user_id: int):
         imported_count = 0
         page_token = None
         
-        while True:
-            result = await google_service.list_emails(
-                max_results=100, 
-                page_token=page_token,
-                query=query
-            )
-            messages = result.get("messages", [])
-            
-            if not messages:
-                break
-            
-            for msg in messages:
-                gmail_id = msg["id"]
+        try:
+            while True:
+                try:
+                    result = await google_service.list_emails(
+                        max_results=100, 
+                        page_token=page_token,
+                        query=query
+                    )
+                except httpx.HTTPStatusError as e:
+                    if e.response.status_code == 401:
+                        # Token expired, clear connection
+                        clear_google_connection(user, db)
+                        print(f"Email polling failed for user {user_id}: Token expired (401). Connection cleared.")
+                        return
+                    raise
                 
-                # Check if already imported
-                existing = db.query(Email).filter(
-                    Email.user_id == user_id,
-                    Email.gmail_id == gmail_id
-                ).first()
+                messages = result.get("messages", [])
                 
-                if existing:
-                    continue
+                if not messages:
+                    break
                 
-                # Get full email
-                email_data = await google_service.get_email(gmail_id)
-                parsed = google_service._parse_email(email_data)
-                
-                # Only import if received after cutoff (double check)
-                if parsed.get("received_at"):
+                for msg in messages:
+                    gmail_id = msg["id"]
+                    
+                    # Check if already imported
+                    existing = db.query(Email).filter(
+                        Email.user_id == user_id,
+                        Email.gmail_id == gmail_id
+                    ).first()
+                    
+                    if existing:
+                        continue
+                    
+                    # Get full email
                     try:
-                        from dateutil import parser
-                        received_at = parser.parse(parsed["received_at"])
-                        # Convert to UTC naive datetime for comparison
-                        if received_at.tzinfo:
-                            received_at = received_at.astimezone(tz=None).replace(tzinfo=None)
-                        if received_at < cutoff_time:
-                            continue
-                    except:
-                        # If parsing fails, import anyway (better safe than sorry)
-                        pass
-                
-                # Create email record
-                email_obj = Email(
-                    user_id=user_id,
-                    gmail_id=gmail_id,
-                    thread_id=parsed.get("thread_id"),
-                    subject=parsed.get("subject"),
-                    from_email=parsed.get("from_email"),
-                    to_emails=parsed.get("to_emails"),
-                    cc_emails=parsed.get("cc_emails"),
-                    body_text=parsed.get("body_text"),
-                    body_html=parsed.get("body_html"),
-                    received_at=parsed.get("received_at")
-                )
-                
-                db.add(email_obj)
-                db.commit()
-                db.refresh(email_obj)
-                
-                # Create embedding
-                text_content = f"{parsed.get('subject', '')} {parsed.get('body_text', '')}"
-                if text_content.strip():
-                    embedding = get_embedding(text_content)
-                    email_obj.embedding = embedding
+                        email_data = await google_service.get_email(gmail_id)
+                    except httpx.HTTPStatusError as e:
+                        if e.response.status_code == 401:
+                            # Token expired, clear connection
+                            clear_google_connection(user, db)
+                            print(f"Email polling failed for user {user_id}: Token expired (401). Connection cleared.")
+                            return
+                        raise
+                    parsed = google_service._parse_email(email_data)
+                    
+                    # Only import if received after cutoff (double check)
+                    if parsed.get("received_at"):
+                        try:
+                            from dateutil import parser
+                            received_at = parser.parse(parsed["received_at"])
+                            # Convert to UTC naive datetime for comparison
+                            if received_at.tzinfo:
+                                received_at = received_at.astimezone(tz=None).replace(tzinfo=None)
+                            if received_at < cutoff_time:
+                                continue
+                        except:
+                            # If parsing fails, import anyway (better safe than sorry)
+                            pass
+                    
+                    # Create email record
+                    email_obj = Email(
+                        user_id=user_id,
+                        gmail_id=gmail_id,
+                        thread_id=parsed.get("thread_id"),
+                        subject=parsed.get("subject"),
+                        from_email=parsed.get("from_email"),
+                        to_emails=parsed.get("to_emails"),
+                        cc_emails=parsed.get("cc_emails"),
+                        body_text=parsed.get("body_text"),
+                        body_html=parsed.get("body_html"),
+                        received_at=parsed.get("received_at")
+                    )
+                    
+                    db.add(email_obj)
                     db.commit()
+                    db.refresh(email_obj)
+                    
+                    # Create embedding
+                    text_content = f"{parsed.get('subject', '')} {parsed.get('body_text', '')}"
+                    if text_content.strip():
+                        embedding = get_embedding(text_content)
+                        email_obj.embedding = embedding
+                        db.commit()
+                    
+                    imported_count += 1
+                    
+                    # Process ongoing instructions for new email
+                    from app.services.ai_agent import AIAgent
+                    agent = AIAgent(db, user)
+                    await agent.process_ongoing_instructions("email", {
+                        "email_id": gmail_id,
+                        "from": parsed.get("from_email"),
+                        "subject": parsed.get("subject"),
+                        "body": parsed.get("body_text")
+                    })
                 
-                imported_count += 1
-                
-                # Process ongoing instructions for new email
-                from app.services.ai_agent import AIAgent
-                agent = AIAgent(db, user)
-                await agent.process_ongoing_instructions("email", {
-                    "email_id": gmail_id,
-                    "from": parsed.get("from_email"),
-                    "subject": parsed.get("subject"),
-                    "body": parsed.get("body_text")
-                })
+                page_token = result.get("nextPageToken")
+                if not page_token:
+                    break
             
-            page_token = result.get("nextPageToken")
-            if not page_token:
-                break
+            if imported_count > 0:
+                print(f"Polled {imported_count} new emails for user {user_id}")
         
-        if imported_count > 0:
-            print(f"Polled {imported_count} new emails for user {user_id}")
-        
-    except Exception as e:
-        print(f"Error polling new emails for user {user_id}: {e}")
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 401:
+                # Token expired, clear connection
+                clear_google_connection(user, db)
+                print(f"Email polling failed for user {user_id}: Token expired (401). Connection cleared.")
+            else:
+                raise
+        except Exception as e:
+            print(f"Error polling new emails for user {user_id}: {e}")
     finally:
         db.close()
 
