@@ -467,8 +467,6 @@ async def poll_new_emails(user_id: int):
         if user_id in sync_status and sync_status[user_id].get("gmail", {}).get("syncing", False):
             return
 
-        print("Polling for new emails", user.google_token_expires_at);
-
         # Check if token is expired - if so, skip polling (user will need to reconnect)
         if user.google_token_expires_at:
             now = datetime.now(timezone.utc)

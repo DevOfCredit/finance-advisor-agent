@@ -4,7 +4,7 @@ Authentication routes.
 Handles Google OAuth and HubSpot OAuth flows.
 """
 
-from fastapi import APIRouter, Header, Depends, HTTPException, status
+from fastapi import APIRouter, Header, Depends, HTTPException, status, Query
 from fastapi.responses import RedirectResponse
 from sqlalchemy.orm import Session
 from authlib.integrations.httpx_client import AsyncOAuth2Client
@@ -14,6 +14,7 @@ from app.auth import create_access_token
 from app.config import settings
 from app.services.google_service import GoogleService
 from app.services.hubspot_service import HubSpotService
+from typing import Optional
 import httpx
 
 router = APIRouter()
@@ -132,11 +133,54 @@ async def google_callback(code: str, db: Session = Depends(get_db)):
 
 
 @router.get("/hubspot")
-async def hubspot_auth():
+async def hubspot_auth(
+    token: Optional[str] = Query(None, description="JWT token for authentication"),
+    authorization: Optional[str] = Header(None, alias="Authorization"),
+    db: Session = Depends(get_db)
+):
     """
     Initiate HubSpot OAuth flow.
     Redirects user to HubSpot consent screen.
+    Requires authentication to identify which user is connecting.
+    Accepts token as query parameter or Authorization header.
     """
+    # Get token from query parameter or header
+    auth_token = token
+    if not auth_token and authorization and authorization.startswith("Bearer "):
+        auth_token = authorization.split(" ")[1]
+    
+    if not auth_token:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Authentication required. Please log in first."
+        )
+    
+    from app.auth import verify_token
+    payload = verify_token(auth_token)
+    
+    if not payload:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid token"
+        )
+    
+    user_id = payload.get("user_id")
+    user = db.query(User).filter(User.id == user_id).first()
+    
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="User not found"
+        )
+    
+    # Encode user_id in state parameter
+    import base64
+    import json
+    state_data = {"user_id": user_id}
+    state_encoded = base64.urlsafe_b64encode(
+        json.dumps(state_data).encode()
+    ).decode()
+    
     oauth = AsyncOAuth2Client(
         client_id=settings.HUBSPOT_CLIENT_ID,
         client_secret=settings.HUBSPOT_CLIENT_SECRET,
@@ -149,29 +193,34 @@ async def hubspot_auth():
             "crm.objects.contacts.read",
             "crm.objects.contacts.write",
             "oauth",
-        ]
-        # scope=[
-        #     "oauth crm.objects.contacts.read crm.objects.contacts.write"
-        # ]
+        ],
+        state=state_encoded  # Use our encoded state with user_id
     )
     
     return RedirectResponse(url=authorization_url)
 
 
 @router.get("/hubspot/callback")
-async def hubspot_callback(code: str, db: Session = Depends(get_db)):
+async def hubspot_callback(code: str, state: Optional[str] = None, db: Session = Depends(get_db)):
     """
     Handle HubSpot OAuth callback.
     Exchanges authorization code for tokens and updates user.
     """
-    oauth = AsyncOAuth2Client(
-        client_id=settings.HUBSPOT_CLIENT_ID,
-        client_secret=settings.HUBSPOT_CLIENT_SECRET,
-        redirect_uri=settings.HUBSPOT_REDIRECT_URI
-    )
-    print("code", code);
-    
     try:
+        # Decode user_id from state parameter
+        user_id = None
+        if state:
+            try:
+                import base64
+                import json
+                state_decoded = base64.urlsafe_b64decode(state.encode()).decode()
+                state_data = json.loads(state_decoded)
+                user_id = state_data.get("user_id")
+            except Exception as e:
+                print(f"Error decoding state: {e}")
+                # If state decoding fails, fall back to most recent user (backward compatibility)
+                pass
+        
         # HubSpot's token endpoint requires specific parameters
         # Using direct HTTP request as authlib might not format it correctly
         async with httpx.AsyncClient() as client:
@@ -188,6 +237,7 @@ async def hubspot_callback(code: str, db: Session = Depends(get_db)):
             )
             token_response.raise_for_status()
             token = token_response.json()
+        
         access_token = token["access_token"]
         refresh_token = token.get("refresh_token")
         expires_at = None
@@ -200,13 +250,18 @@ async def hubspot_callback(code: str, db: Session = Depends(get_db)):
         account_info = await hubspot_service.get_account_info()
         account_name = account_info.get("portalId") or "HubSpot Account"
         
-        # Get user from token (in production, get from session/JWT)
-        # For now, we'll need to pass user_id or get from session
-        # This is a simplified version - in production, use proper session management
-        user = db.query(User).order_by(User.id.desc()).first()  # Get most recent user
+        # Get user by user_id from state, or fall back to most recent user
+        if user_id:
+            user = db.query(User).filter(User.id == user_id).first()
+        else:
+            # Fallback: get most recent user (for backward compatibility)
+            user = db.query(User).order_by(User.id.desc()).first()
         
         if not user:
-            raise HTTPException(status_code=404, detail="User not found. Please log in with Google first.")
+            raise HTTPException(
+                status_code=404, 
+                detail="User not found. Please log in with Google first."
+            )
         
         # Update user with HubSpot tokens
         user.hubspot_access_token = access_token
@@ -222,6 +277,8 @@ async def hubspot_callback(code: str, db: Session = Depends(get_db)):
         )
     
     except Exception as e:
+        import traceback
+        traceback.print_exc()
         raise HTTPException(
             status_code=500,
             detail=f"HubSpot OAuth callback failed: {str(e)}"

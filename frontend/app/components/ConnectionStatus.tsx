@@ -22,7 +22,12 @@ export default function ConnectionStatus() {
   }
 
   const handleConnectHubSpot = () => {
-    window.location.href = `${API_URL}/api/auth/hubspot`
+    if (!token) {
+      alert('Please log in first')
+      return
+    }
+    // Pass token as query parameter since window.location.href doesn't support custom headers
+    window.location.href = `${API_URL}/api/auth/hubspot?token=${encodeURIComponent(token)}`
   }
 
   const handleSyncGmail = async (mode: 'month' | 'all' = 'month') => {
